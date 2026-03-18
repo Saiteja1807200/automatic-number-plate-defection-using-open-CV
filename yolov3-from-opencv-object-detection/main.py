@@ -1,115 +1,218 @@
 import os
-
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 import easyocr
+import pandas as pd
+from datetime import datetime
+from pathlib import Path
+import argparse
 
-import util
+# ────────────────────────────────────────────────
+#  Assuming you still use your util.py for YOLO helpers
+#  If not → replace get_outputs() and NMS() with cv2.dnn functions
+# ────────────────────────────────────────────────
+import util   # your original util.py with get_outputs() and NMS()
+
+# ────────────────────────────────────────────────
+# CONFIG
+# ────────────────────────────────────────────────
+
+BASE_DIR = Path(__file__).parent
+MODEL_CFG     = BASE_DIR / "model" / "cfg" / "darknet-yolov3.cfg"
+MODEL_WEIGHTS = BASE_DIR / "model" / "weights" / "model.weights"
+CLASS_NAMES   = BASE_DIR / "model" / "class.names"
+
+OUTPUT_CSV    = BASE_DIR / "output" / "detected_plates.csv"
+OUTPUT_DIR    = BASE_DIR / "output"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+CONF_THRESHOLD    = 0.40
+NMS_THRESHOLD     = 0.45
+OCR_CONF_THRESHOLD = 0.50
+
+# ────────────────────────────────────────────────
+# GLOBAL STATE
+# ────────────────────────────────────────────────
+
+results = []                    # list of dicts → will become CSV
+reader = None
+net = None
+
+# ────────────────────────────────────────────────
+# INIT
+# ────────────────────────────────────────────────
+
+def init_model():
+    global net, reader
+
+    print("Loading YOLOv3 model...")
+    net = cv2.dnn.readNetFromDarknet(str(MODEL_CFG), str(MODEL_WEIGHTS))
+    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)     # change to DNN_TARGET_CUDA if you have GPU
+
+    print("Initializing EasyOCR...")
+    reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+
+    print("Model & OCR ready.\n")
 
 
-# define constants
-model_cfg_path = os.path.join('.', 'model', 'cfg', 'darknet-yolov3.cfg')
-model_weights_path = os.path.join('.', 'model', 'weights', 'model.weights')
-class_names_path = os.path.join('.', 'model', 'class.names')
+def clean_plate_text(text: str) -> str:
+    """Remove unwanted characters, keep alphanumeric only, upper case"""
+    return ''.join(c for c in text.upper() if c.isalnum())
 
-input_dir = '/home/phillip/Desktop/todays_tutorial/22_anpr/code/data'
 
-for img_name in os.listdir(input_dir):
+def process_frame(frame, save_image=False, img_name=None):
+    global results
 
-    img_path = os.path.join(input_dir, img_name)
+    if frame is None:
+        return frame
 
-    # load class names
-    with open(class_names_path, 'r') as f:
-        class_names = [j[:-1] for j in f.readlines() if len(j) > 2]
-        f.close()
+    h, w = frame.shape[:2]
 
-    # load model
-    net = cv2.dnn.readNetFromDarknet(model_cfg_path, model_weights_path)
-
-    # load image
-
-    img = cv2.imread(img_path)
-
-    H, W, _ = img.shape
-
-    # convert image
-    blob = cv2.dnn.blobFromImage(img, 1 / 255, (416, 416), (0, 0, 0), True)
-
-    # get detections
+    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
     net.setInput(blob)
+    outs = util.get_outputs(net)                    # from your util.py
 
-    detections = util.get_outputs(net)
+    boxes, confidences, class_ids = [], [], []
 
-    # bboxes, class_ids, confidences
-    bboxes = []
-    class_ids = []
-    scores = []
+    for out in outs:
+        for detection in out:
+            scores = detection[5:]
+            class_id = np.argmax(scores)
+            conf = scores[class_id]
 
-    for detection in detections:
-        # [x1, x2, x3, x4, x5, x6, ..., x85]
-        bbox = detection[:4]
+            if conf > CONF_THRESHOLD:
+                center_x = int(detection[0] * w)
+                center_y = int(detection[1] * h)
+                width    = int(detection[2] * w)
+                height   = int(detection[3] * h)
 
-        xc, yc, w, h = bbox
-        bbox = [int(xc * W), int(yc * H), int(w * W), int(h * H)]
+                x = center_x - width // 2
+                y = center_y - height // 2
 
-        bbox_confidence = detection[4]
+                boxes.append([x, y, width, height])
+                confidences.append(float(conf))
+                class_ids.append(class_id)
 
-        class_id = np.argmax(detection[5:])
-        score = np.amax(detection[5:])
+    # Apply NMS
+    indices = cv2.dnn.NMSBoxes(boxes, confidences, CONF_THRESHOLD, NMS_THRESHOLD)
 
-        bboxes.append(bbox)
-        class_ids.append(class_id)
-        scores.append(score)
+    frame_copy = frame.copy()
 
-    # apply nms
-    bboxes, class_ids, scores = util.NMS(bboxes, class_ids, scores)
+    for i in indices:
+        box = boxes[i]
+        x, y, w, h = box
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(x + w, w), min(y + h, h)
 
-    # plot
-    reader = easyocr.Reader(['en'])
-    for bbox_, bbox in enumerate(bboxes):
-        xc, yc, w, h = bbox
+        # Draw box & confidence
+        cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        label = f"{confidences[i]:.2f}"
+        cv2.putText(frame_copy, label, (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        """
-        cv2.putText(img,
-                    class_names[class_ids[bbox_]],
-                    (int(xc - (w / 2)), int(yc + (h / 2) - 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    7,
-                    (0, 255, 0),
-                    15)
-        """
+        # Crop plate
+        plate = frame[y1:y2, x1:x2]
+        if plate.size == 0:
+            continue
 
-        license_plate = img[int(yc - (h / 2)):int(yc + (h / 2)), int(xc - (w / 2)):int(xc + (w / 2)), :].copy()
+        # OCR
+        ocr_results = reader.readtext(plate, detail=1, paragraph=False)
+        for (_, text, ocr_conf) in ocr_results:
+            if ocr_conf >= OCR_CONF_THRESHOLD:
+                clean_text = clean_plate_text(text)
+                if len(clean_text) < 4:
+                    continue
 
-        img = cv2.rectangle(img,
-                            (int(xc - (w / 2)), int(yc - (h / 2))),
-                            (int(xc + (w / 2)), int(yc + (h / 2))),
-                            (0, 255, 0),
-                            15)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        license_plate_gray = cv2.cvtColor(license_plate, cv2.COLOR_BGR2GRAY)
+                entry = {
+                    "timestamp": timestamp,
+                    "source": img_name or "webcam",
+                    "plate": clean_text,
+                    "yolo_conf": round(confidences[i], 3),
+                    "ocr_conf": round(ocr_conf, 3)
+                }
 
-        _, license_plate_thresh = cv2.threshold(license_plate_gray, 64, 255, cv2.THRESH_BINARY_INV)
+                results.append(entry)
+                print(f"[{timestamp}]  {clean_text:10}   (YOLO: {entry['yolo_conf']:.3f} | OCR: {entry['ocr_conf']:.3f})")
 
-        output = reader.readtext(license_plate_thresh)
+                # Optional: save individual crop
+                if save_image:
+                    cv2.imwrite(str(OUTPUT_DIR / f"plate_{timestamp.replace(':', '-')}.jpg"), plate)
 
-        for out in output:
-            text_bbox, text, text_score = out
-            if text_score > 0.4:
-                print(text, text_score)
+    return frame_copy
 
 
-    plt.figure()
-    plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+def save_results():
+    if not results:
+        print("\nNo plates detected.")
+        return
 
-    plt.figure()
-    plt.imshow(cv2.cvtColor(license_plate, cv2.COLOR_BGR2RGB))
+    df = pd.DataFrame(results)
+    # Sort by time (useful if mixing images + webcam)
+    df = df.sort_values("timestamp")
 
-    plt.figure()
-    plt.imshow(cv2.cvtColor(license_plate_gray, cv2.COLOR_BGR2RGB))
+    df.to_csv(OUTPUT_CSV, index=False)
+    print(f"\nSaved {len(df)} detections → {OUTPUT_CSV}")
+    print(df)
 
-    plt.figure()
-    plt.imshow(cv2.cvtColor(license_plate_thresh, cv2.COLOR_BGR2RGB))
 
-    plt.show()
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image", type=str, help="Path to single image")
+    parser.add_argument("--folder", action="store_true", help="Process all images in ../data")
+    args = parser.parse_args()
+
+    init_model()
+
+    if args.image:
+        # Single image mode
+        img = cv2.imread(args.image)
+        if img is None:
+            print("Cannot read image")
+            return
+
+        processed = process_frame(img, save_image=True, img_name=Path(args.image).name)
+        cv2.imwrite(str(OUTPUT_DIR / f"annotated_{Path(args.image).name}"), processed)
+        cv2.imshow("Result", processed)
+        cv2.waitKey(0)
+
+    elif args.folder:
+        # Batch folder mode (your original data folder)
+        for p in (BASE_DIR.parent / "data").glob("*.[jpJP][pnPN][gG]*"):
+            img = cv2.imread(str(p))
+            if img is None:
+                continue
+            process_frame(img, save_image=True, img_name=p.name)
+
+    else:
+        # ── Default: Webcam live ──────────────────────────────────────
+        cap = cv2.VideoCapture(0)   # 0 = default webcam
+
+        if not cap.isOpened():
+            print("Cannot open webcam")
+            return
+
+        print("Webcam opened. Press 'q' to quit and save results.\n")
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            processed = process_frame(frame)
+            cv2.imshow("ANPR - Webcam", processed)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+    # Final save
+    save_results()
+
+
+if __name__ == "__main__":
+    main()
